@@ -19,21 +19,29 @@ _RETRYABLE = (SerializationFailure, DeadlockDetected)
 
 
 def run_tx(fn, *, readonly: bool = False, retries: int | None = None,
-           advisory_lock: tuple[int, int] | None = None) -> T:
+           advisory_lock: tuple[int, int] | list[tuple[int, int]] | None = None) -> T:
     """在 SERIALIZABLE 事务中执行 ``fn(conn)``；冲突时整体重试。
 
     ``fn`` 内部抛出的 HTTPException 会原样透传（不重试）。
     数据库层约束冲突同样透传，由各路由映射为 409。
 
-    提供 ``advisory_lock=(namespace, key)`` 时，每次尝试在事务**之前**获取
-    会话级咨询锁（pg_advisory_lock，跨事务持有），退出（含异常/重试）时立即
-    释放。同键写事务由此严格按取锁先后串行——后到者在锁外等待，其事务快照
-    必然晚于前者提交，保证“后开始的判定不会用到更早状态”（例如不会在已
-    生效禁用区间内误放行）。锁在事务外获取，不进入事务快照。
+    提供 ``advisory_lock=(namespace, key)`` 或一组锁时，每次尝试在事务**之前**
+    按给出的顺序获取会话级咨询锁（pg_advisory_lock，跨事务持有），退出（含异常/
+    重试）时按相反顺序释放。同键写事务由此严格按取锁先后串行——后到者在锁外
+    等待，其事务快照必然晚于前者提交，保证“后开始的判定不会用到更早状态”
+    （例如不会在已生效禁用区间内误放行，或对同一链尾同时撤回与接替）。
+    锁在事务外获取，不进入事务快照。
     """
     settings = get_settings()
     attempts = settings.tx_max_retries if retries is None else retries
     assert db.pool is not None
+
+    if advisory_lock is None:
+        locks: list[tuple[int, int]] = []
+    elif isinstance(advisory_lock, tuple):
+        locks = [advisory_lock]
+    else:
+        locks = list(advisory_lock)
 
     last_error: Exception | None = None
     for attempt in range(attempts + 1):
@@ -48,11 +56,12 @@ def run_tx(fn, *, readonly: bool = False, retries: int | None = None,
             })
         locked = False
         try:
-            if advisory_lock is not None:
-                # 自动提交状态下获取会话级咨询锁；立即生效且跨事务保持
+            if locks:
+                # 自动提交状态下按序获取会话级咨询锁；立即生效且跨事务保持
                 conn.autocommit = True
-                conn.execute("SELECT pg_advisory_lock(%s, %s)",
-                             (advisory_lock[0], advisory_lock[1]))
+                for ns, key in locks:
+                    conn.execute("SELECT pg_advisory_lock(%s::int4, %s::int4)",
+                                 (ns, key))
                 locked = True
                 conn.autocommit = False
             conn.read_only = readonly
@@ -77,11 +86,13 @@ def run_tx(fn, *, readonly: bool = False, retries: int | None = None,
             time.sleep(settings.tx_retry_backoff * (2**attempt))
         finally:
             if locked:
-                # 事务可能已失败：回到自动提交模式释放，确保归还的连接不带锁
+                # 事务可能已失败：回到自动提交模式按相反顺序释放，
+                # 确保归还的连接不带锁
                 try:
                     conn.autocommit = True
-                    conn.execute("SELECT pg_advisory_unlock(%s, %s)",
-                                 (advisory_lock[0], advisory_lock[1]))
+                    for ns, key in reversed(locks):
+                        conn.execute("SELECT pg_advisory_unlock(%s::int4, %s::int4)",
+                                     (ns, key))
                 except Exception:  # pragma: no cover - 连接断开时锁随连接释放
                     pass
                 finally:

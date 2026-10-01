@@ -97,6 +97,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_old_report
 CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_new_report
     ON report_supersessions (new_report_id);
 
+-- 报告撤回登记：质控人员按“报告 ID + 唯一撤回单号 + 非空原因”撤回。
+-- 仅在链尾且未撤回的报告可撤回（应用层 + 行锁/链咨询锁保证，下方触发器兜底）；
+-- 报告行与其发布快照不改写、不删除，撤回记录永久保留供沿革/审计追溯。
+CREATE TABLE IF NOT EXISTS report_withdrawals (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    report_id     BIGINT      NOT NULL REFERENCES reports(id),
+    withdrawal_no TEXT        NOT NULL,          -- 业务侧唯一撤回单号（不得转给其他报告）
+    reason        TEXT        NOT NULL,          -- 撤回原因（非空，应用层校验）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 每份报告至多撤回一次 —— 并发撤回至多成功一次
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_withdrawal_report
+    ON report_withdrawals (report_id);
+-- 撤回单号全局唯一：同一撤回单不得转给其他报告（含已撤回报告，单号不可复用）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_withdrawal_no
+    ON report_withdrawals (withdrawal_no);
+
+-- 跨表不变量兜底：一份报告不能同时“已撤回”且“已被复测接替”。
+-- 常规路径由链尾行锁 + 报告级咨询锁串行保证；触发器防御任何绕过应用层的写入。
+CREATE OR REPLACE FUNCTION fn_guard_supersede_withdrawn() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM report_withdrawals w WHERE w.report_id = NEW.old_report_id) THEN
+        RAISE EXCEPTION 'E_REPORT_WITHDRAWN: 报告 % 已撤回，不能被复测接替', NEW.old_report_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard_supersede_withdrawn ON report_supersessions;
+CREATE TRIGGER trg_guard_supersede_withdrawn
+    BEFORE INSERT ON report_supersessions
+    FOR EACH ROW EXECUTE FUNCTION fn_guard_supersede_withdrawn();
+
+CREATE OR REPLACE FUNCTION fn_guard_withdraw_superseded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM report_supersessions s WHERE s.old_report_id = NEW.report_id) THEN
+        RAISE EXCEPTION 'E_REPORT_SUPERSEDED: 报告 % 已被接替（非链尾），不能撤回', NEW.report_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS trg_guard_withdraw_superseded ON report_withdrawals;
+CREATE TRIGGER trg_guard_withdraw_superseded
+    BEFORE INSERT ON report_withdrawals
+    FOR EACH ROW EXECUTE FUNCTION fn_guard_withdraw_superseded();
+
 -- 仪器禁用区间（校准合格后仪器仍可能因故障被禁用）。
 -- 撤销仅置 revoked = TRUE，记录保留供追溯。
 CREATE TABLE IF NOT EXISTS instrument_disable_events (
@@ -193,3 +241,14 @@ def instrument_lock_key(instrument: str) -> tuple[int, int]:
     with pool.connection() as conn:
         row = conn.execute("SELECT hashtext(%s) AS h", (instrument,)).fetchone()
     return ADVISORY_LOCK_NS, row["h"]
+
+
+def report_lock_key(report_id: int) -> tuple[int, int]:
+    """报告链级会话咨询锁键 (命名空间, report_id)；事务外调用。
+
+    同一链尾的“撤回 / 复测接替”据此严格串行：取锁后才开始事务，
+    后到者的事务快照必然晚于前者提交，至多一方成功，败方读到最新链状态。
+    """
+    from .repository import REPORT_LOCK_NS
+
+    return REPORT_LOCK_NS, int(report_id)

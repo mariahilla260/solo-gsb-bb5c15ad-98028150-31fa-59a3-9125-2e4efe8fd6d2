@@ -63,6 +63,29 @@ class SupersedeSubmit(BaseModel):
         return value
 
 
+class WithdrawSubmit(BaseModel):
+    """报告撤回登记：唯一撤回单号 + 非空原因；路径参数给出报告 ID。"""
+
+    withdrawal_no: str = Field(
+        ..., min_length=1,
+        description="唯一撤回单号（业务侧生成；同号撤回单不得转给其他报告，也不可复用）")
+    reason: str = Field(..., min_length=1, description="撤回原因（非空，不允许纯空白，如样本身份错误说明）")
+
+    @field_validator("withdrawal_no")
+    @classmethod
+    def _no_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("撤回单号不能为空")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("撤回原因不能为空")
+        return value
+
+
 class DisableCreate(BaseModel):
     event_no: str = Field(..., min_length=1, description="唯一禁用事件号（业务侧生成，撤销后也不可复用）")
     instrument: str = Field(..., min_length=1, description="仪器标识")
@@ -111,6 +134,16 @@ def serialize_supersession(row: dict[str, Any]) -> dict[str, Any]:
         "id": row["id"],
         "old_report_id": row["old_report_id"],
         "new_report_id": row["new_report_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+def serialize_withdrawal(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "report_id": row["report_id"],
+        "withdrawal_no": row["withdrawal_no"],
         "reason": row["reason"],
         "created_at": row["created_at"].isoformat(),
     }
