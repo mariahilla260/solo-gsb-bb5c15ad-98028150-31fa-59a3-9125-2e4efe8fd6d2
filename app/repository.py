@@ -362,6 +362,20 @@ def supersede_report(conn, report_id: int, payload) -> dict[str, Any]:
             (report_id,),
         )
         existing = cur.fetchone()
+        # 撤回同样是链尾终结：已撤回的链尾不得再复测接替（也不生成新报告）
+        cur.execute(
+            "SELECT * FROM report_withdrawals WHERE report_id = %s",
+            (report_id,),
+        )
+        withdrawn = cur.fetchone()
+    if withdrawn is not None:
+        raise conflict(
+            "REPORT_WITHDRAWN",
+            f"报告 {report_id} 已被撤回（撤回单 {withdrawn['withdrawal_no']}），"
+            "撤回后不得复测接替，也不生成新报告",
+            old_report_id=report_id,
+            withdrawal_no=withdrawn["withdrawal_no"],
+        )
     if existing is not None:
         raise conflict(
             "REPORT_ALREADY_SUPERSEDED",
@@ -427,7 +441,11 @@ _CHAIN_MEMBERS_CTE = """
 
 
 def chain_tip_id(conn, report_id: int) -> int:
-    """该报告所在接替链的当前有效报告（未被接替的链尾）。"""
+    """该报告所在接替链的链尾（没有接替出边的报告）。
+
+    注意链尾未必可使用：链尾若已撤回，``chain_state`` 的
+    ``current_report_id`` 为 NULL。本函数仅回答“链尾是谁”。
+    """
     with conn.cursor() as cur:
         cur.execute(
             _CHAIN_MEMBERS_CTE + """
@@ -445,10 +463,122 @@ def chain_tip_id(conn, report_id: int) -> int:
     return row["id"] if row else report_id
 
 
-def report_lineage(conn, report_id: int) -> dict[str, Any] | None:
-    """完整沿革：链内全部报告（含各自不可变快照）、每次接替记录、当前有效报告。
+def chain_state(conn, report_id: int) -> dict[str, Any] | None:
+    """链状态：区分“链尾标识”与“当前可使用标识”。
 
-    报告不存在返回 None。只读，不改写任何报告与快照。
+    - ``tip_report_id``：接替链链尾，始终非空（报告存在时）；
+    - ``current_report_id``：当前可使用的现行报告；链尾被撤回时为 NULL；
+    - ``withdrawal``：链尾撤回记录（未撤回为 NULL）。
+
+    报告不存在返回 None。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM reports WHERE id = %s", (report_id,))
+        if cur.fetchone() is None:
+            return None
+        tip = chain_tip_id(conn, report_id)
+        cur.execute(
+            "SELECT * FROM report_withdrawals WHERE report_id = %s", (tip,)
+        )
+        withdrawal = cur.fetchone()
+    return {
+        "tip_report_id": tip,
+        "current_report_id": None if withdrawal else tip,
+        "withdrawal": withdrawal,
+    }
+
+
+def withdraw_report(conn, report_id: int, payload) -> dict[str, Any]:
+    """登记撤回：仅链尾且尚未撤回、且尚未被接替的报告可撤回。
+
+    - 报告不存在 -> 404
+    - 已被接替（非链尾）-> 409 REPORT_ALREADY_SUPERSEDED，附当前链状态
+    - 链尾已撤回（含并发撤回败方）-> 409 REPORT_ALREADY_WITHDRAWN，附链状态
+    - 撤回单号已属于其他报告（不可转移/复用，含并发）->
+      409 WITHDRAWAL_NO_EXISTS，附该单号当前归属
+    失败整体回滚：不写撤回记录。成功后链尾报告与其发布快照永久保留。
+    """
+    with conn.cursor() as cur:
+        # 锁报告行：同一链尾的“撤回 / 接替”并发在此互斥，至多一方成功
+        cur.execute("SELECT * FROM reports WHERE id = %s FOR UPDATE", (report_id,))
+        report = cur.fetchone()
+        if report is None:
+            raise not_found("报告", report_id)
+        cur.execute(
+            "SELECT * FROM report_supersessions WHERE old_report_id = %s",
+            (report_id,),
+        )
+        superseded = cur.fetchone()
+        cur.execute(
+            "SELECT * FROM report_withdrawals WHERE report_id = %s",
+            (report_id,),
+        )
+        own_withdrawal = cur.fetchone()
+        if superseded is not None:
+            state = chain_state(conn, report_id)
+            raise conflict(
+                "REPORT_ALREADY_SUPERSEDED",
+                f"报告 {report_id} 已被报告 {superseded['new_report_id']} 接替，"
+                "只有接替链链尾报告才能撤回",
+                old_report_id=report_id,
+                superseded_by=superseded["new_report_id"],
+                tip_report_id=state["tip_report_id"],
+                current_report_id=state["current_report_id"],
+            )
+        if own_withdrawal is not None:
+            state = chain_state(conn, report_id)
+            raise conflict(
+                "REPORT_ALREADY_WITHDRAWN",
+                f"报告 {report_id} 已撤回（撤回单 {own_withdrawal['withdrawal_no']}），"
+                "不能重复撤回",
+                report_id=report_id,
+                withdrawal_no=own_withdrawal["withdrawal_no"],
+                tip_report_id=state["tip_report_id"],
+                current_report_id=state["current_report_id"],
+            )
+        # 撤回单号全局唯一：先给归属（含已使用场景的明确归属），
+        # 唯一索引再对“并发同号”兜底（事务出错后不能再发 SQL，故归属提前取）
+        cur.execute(
+            "SELECT report_id FROM report_withdrawals WHERE withdrawal_no = %s",
+            (payload.withdrawal_no,),
+        )
+        holder = cur.fetchone()
+        if holder is not None:
+            raise conflict(
+                "WITHDRAWAL_NO_EXISTS",
+                f"撤回单号已存在且不可转给其他报告或复用: {payload.withdrawal_no}",
+                withdrawal_no=payload.withdrawal_no,
+                bound_report_id=holder["report_id"],
+            )
+        try:
+            cur.execute(
+                """
+                INSERT INTO report_withdrawals (report_id, withdrawal_no, reason)
+                VALUES (%s, %s, %s)
+                RETURNING *
+                """,
+                (report_id, payload.withdrawal_no, payload.reason),
+            )
+        except UniqueViolation:
+            # 仅可能是并发事务抢先登记了同一单号（归属以对方提交后为准）：
+            # 当前事务已中止，不再发 SQL，败方事务整体回滚
+            raise conflict(
+                "WITHDRAWAL_NO_EXISTS",
+                f"撤回单号被并发抢先登记，不可转给其他报告或复用: {payload.withdrawal_no}",
+                withdrawal_no=payload.withdrawal_no,
+                bound_report_id=None,
+            )
+        withdrawal = cur.fetchone()
+    return {"report": report, "withdrawal": withdrawal}
+
+
+def report_lineage(conn, report_id: int) -> dict[str, Any] | None:
+    """完整沿革：链内全部报告（含各自不可变快照）、每次接替记录、撤回记录、
+    链尾标识与当前可使用报告。
+
+    报告不存在返回 None。只读，不改写任何报告与快照。撤回后链仍可完整追溯：
+    ``tip_report_id`` 指向被撤回的链尾，``current_report_id`` 为 NULL，
+    ``withdrawals`` 给出撤回单、原因与时间。
     """
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM reports WHERE id = %s", (report_id,))
@@ -470,10 +600,23 @@ def report_lineage(conn, report_id: int) -> dict[str, Any] | None:
             (report_id,),
         )
         supersessions = cur.fetchall()
+        cur.execute(
+            _CHAIN_MEMBERS_CTE + """
+            SELECT w.* FROM report_withdrawals w
+            JOIN members m ON m.id = w.report_id
+            ORDER BY w.id
+            """,
+            (report_id,),
+        )
+        withdrawals = cur.fetchall()
     superseded = {s["old_report_id"] for s in supersessions}
-    current = next(r["id"] for r in reports if r["id"] not in superseded)
+    tip = next(r["id"] for r in reports if r["id"] not in superseded)
+    withdrawn_ids = {w["report_id"] for w in withdrawals}
+    # 当前可使用 = 链尾且未撤回；链尾撤回后该链不再有现行报告
+    current = None if tip in withdrawn_ids else tip
     return {"reports": reports, "supersessions": supersessions,
-            "current_report_id": current}
+            "withdrawals": withdrawals,
+            "tip_report_id": tip, "current_report_id": current}
 
 
 # ---- 漂移重算 ------------------------------------------------------------------

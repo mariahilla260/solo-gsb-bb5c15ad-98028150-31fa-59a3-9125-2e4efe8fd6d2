@@ -97,6 +97,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_old_report
 CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_new_report
     ON report_supersessions (new_report_id);
 
+-- 报告撤回（样本身份错误等）：仅“接替链链尾且尚未撤回”的报告可登记撤回。
+-- 撤回不改写 reports 行与其发布快照（永久保留）；登记后该链不再有可使用的
+-- 现行报告（链尾仍是该报告，但 current_report_id 实时计算为 NULL）。
+-- report_id 唯一：每份报告至多撤回一次；withdrawal_no 全局唯一：撤回单号
+-- 不得转给其他报告，亦不可复用。
+CREATE TABLE IF NOT EXISTS report_withdrawals (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    report_id     BIGINT      NOT NULL UNIQUE REFERENCES reports(id),
+    withdrawal_no TEXT        NOT NULL,              -- 业务侧唯一撤回单号
+    reason        TEXT        NOT NULL,              -- 撤回原因（非空，应用层校验）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 撤回单号全局唯一：撤回单只能登记到一份报告，不能转移或复用
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_withdrawal_no
+    ON report_withdrawals (withdrawal_no);
+
 -- 仪器禁用区间（校准合格后仪器仍可能因故障被禁用）。
 -- 撤销仅置 revoked = TRUE，记录保留供追溯。
 CREATE TABLE IF NOT EXISTS instrument_disable_events (

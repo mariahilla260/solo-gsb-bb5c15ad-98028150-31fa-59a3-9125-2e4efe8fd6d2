@@ -26,6 +26,15 @@
   不留下接替记录。
 - 新报告编号仍遵守**全局唯一**，旧编号不得转移或复用；同一旧报告的并发接替**至多成功一次**
   （败方 `409` 并返回现行报告标识）；接替链不分叉、不成环。
+- 已发布报告可由质控人员按**报告 ID + 唯一撤回单号 + 非空原因**登记撤回（如样本身份错误）：
+  仅**接替链链尾且尚未撤回**的报告可撤回；撤回成功后该链**不再有可使用的现行报告**
+  （`tip_report_id` 仍指向链尾，`current_report_id` 为 `null`，两者分列），报告与发布快照
+  **永久保留**，沿革显示撤回单、原因与时间。
+- 撤回后该链尾的**复测接替必须拒绝**（`409 REPORT_WITHDRAWN`）且**不生成新报告**；
+  同一链尾的撤回与接替**并发至多一方成功**，败方返回当前链状态；**撤回单号全局唯一**，
+  不得转给其他报告或复用。报告不存在 / 已接替（非链尾）/ 已撤回均明确拒绝，失败不写撤回。
+- 原有报告详情、列表继续返回历史内容；链尾标识与当前可使用标识分列；已撤回报告仍出现在
+  既有漂移重算与禁用影响追溯结果中。
 - 可按链内**任一报告 ID** 查询完整沿革、每次接替原因与当前有效报告。
 - 可按**当前禁用状态**查询受影响的已发布报告及对应禁用依据；追溯登记或撤销禁用后结果随之变化，
   但原放行记录与快照不改写。
@@ -99,8 +108,9 @@ uvicorn app.main:app --reload
 | POST | `/reports` | 提交报告并判定放行（禁用判定优先于校准判定） |
 | GET | `/reports?instrument=` | 已发布报告列表（含不可变快照，旧版报告保留可查） |
 | GET | `/reports/{id}` | 单条报告 |
-| POST | `/reports/{id}/supersede` | 复测并接替该报告：原子发布新报告 + 接替关系（本轮新增） |
-| GET | `/reports/{id}/lineage` | 完整沿革：链内全部版本、每次接替原因、当前有效报告（本轮新增） |
+| POST | `/reports/{id}/supersede` | 复测并接替该报告：原子发布新报告 + 接替关系 |
+| POST | `/reports/{id}/withdraw` | 质控撤回链尾报告：唯一撤回单号 + 非空原因（本轮新增） |
+| GET | `/reports/{id}/lineage` | 完整沿革：链内全部版本、接替/撤回记录、链尾与当前可使用报告 |
 | GET | `/reports/drift/recompute` | 同上，重算漂移 |
 
 ### 仪器禁用（本轮新增）
@@ -477,6 +487,8 @@ curl -sS -X POST http://localhost:8000/reports/1/supersede \
 - 旧报告不存在：`404 NOT_FOUND`；
 - 旧报告已被接替（含并发接替败方）：`409 REPORT_ALREADY_SUPERSEDED`，
   `detail.current_report_id` 返回该链**现行报告标识**（`superseded_by` 为直接后继）；
+- 旧报告（链尾）**已撤回**：`409 REPORT_WITHDRAWN`——撤回后复测接替必须拒绝，
+  不执行放行判定、不生成新报告，`detail` 附撤回单号与当前链状态；
 - 复测被阻断：与提交报告完全一致的 `422 INSTRUMENT_DISABLED` / `NO_CALIBRATION` /
   `OUTSIDE_VALID_PERIOD` / `CALIBRATION_NOT_PASSED`（禁用判定优先）；
 - 新报告编号冲突（含沿用旧报告编号——旧编号不得转移或复用）：
@@ -495,11 +507,13 @@ curl -sS http://localhost:8000/reports/1/lineage
 ```
 
 返回链内全部报告（按接替顺序，各含**发布时不可变快照**）、每次接替的原因与时间、
-以及当前有效报告；报告不存在返回 `404 NOT_FOUND`：
+撤回记录（撤回单/原因/时间）、**链尾标识** `tip_report_id` 与**当前可使用报告**
+`current_report_id`；报告不存在返回 `404 NOT_FOUND`：
 
 ```json
 {
   "report_id": 1,
+  "tip_report_id": 2,
   "current_report_id": 2,
   "reports": [
     {"id": 1, "reference": "R-2026-0001", "released": true, "snapshot": {"...": "..."}, "...": "..."},
@@ -509,13 +523,82 @@ curl -sS http://localhost:8000/reports/1/lineage
     {"id": 1, "old_report_id": 1, "new_report_id": 2,
      "reason": "初测样品前处理异常，复测", "created_at": "2026-10-01T00:00:00+00:00"}
   ],
+  "withdrawals": [],
   "count": 2
 }
 ```
 
 接替链由数据库唯一索引保证**不分叉**（同一旧报告至多被接替一次）、**不合并**
 （同一新报告至多接替一条旧报告）；接替边恒由当事务内新建的报告指向旧报告，
-链天然**无环**。无接替关系的报告，沿革仅含其自身，`current_report_id` 即其本身。
+链天然**无环**。无接替关系的报告，沿革仅含其自身，`tip_report_id` 与
+`current_report_id` 均为其本身。**链尾被撤回后**：`tip_report_id` 仍指向该报告、
+`current_report_id` 为 `null`，`withdrawals` 给出撤回单、原因与时间。
+
+### 12. 撤回已发布报告（样本身份错误等，本轮新增）
+
+质控人员发现已发布报告**样本身份错误**时，按**报告 ID** 发起撤回，请求体给
+**唯一撤回单号**与**非空原因**：仅**接替链链尾且尚未撤回**的报告可撤回。
+
+```bash
+curl -sS -X POST http://localhost:8000/reports/1/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "withdrawal_no": "WD-2026-0001",
+        "reason": "样本身份错误：与委托单样品编号不一致"
+      }'
+```
+
+成功（`201`）：只登记撤回记录，**不删除、不改写**报告与其发布快照；
+`tip_report_id` 仍是该链尾，`current_report_id` 为 `null`（该链不再有可使用的
+现行报告）：
+
+```json
+{
+  "withdrawn": true,
+  "tip_report_id": 1,
+  "current_report_id": null,
+  "report_id": 1,
+  "withdrawal": {
+    "id": 1,
+    "report_id": 1,
+    "withdrawal_no": "WD-2026-0001",
+    "reason": "样本身份错误：与委托单样品编号不一致",
+    "created_at": "2026-10-01T00:00:00+00:00"
+  }
+}
+```
+
+拒绝约定（任一失败都**整体回滚**，不写撤回）：
+
+- 报告不存在：`404 NOT_FOUND`；
+- 报告已被接替（不是链尾）：`409 REPORT_ALREADY_SUPERSEDED`，
+  `detail.tip_report_id` / `current_report_id` 给出该链**当前链状态**
+  （`superseded_by` 为直接后继）；
+- 链尾已撤回（含并发撤回败方）：`409 REPORT_ALREADY_WITHDRAWN`，
+  `detail` 同样附当前链状态（`tip_report_id` 在、`current_report_id` 为 `null`）；
+- 撤回单号已被使用（**不得转给其他报告或复用**）：
+  `409 WITHDRAWAL_NO_EXISTS`，`detail.bound_report_id` 给出该单号当前归属
+  （并发竞态归属尚未提交时为 `null`）；
+- 撤回单号或原因为空 / 纯空白：`422` 参数校验错误。
+
+撤回后的行为：
+
+- **复测接替必须拒绝**：对已撤回链尾调用 `POST /reports/{id}/supersede`
+  返回 `409 REPORT_WITHDRAWN`（放行判定不再执行），**不生成新报告**、
+  不留接替记录；
+- **历史内容不变**：`GET /reports/{id}` 与 `GET /reports` 继续返回该报告的
+  历史内容与发布时快照；
+- **仍可追溯**：已撤回报告继续出现在 `GET /calibrations/drift/recompute`
+  漂移重算与 `GET /disables/affected-reports` 禁用影响追溯中；
+- 接替链先接替、再撤回**新链尾**是允许的正常终结：沿革同时保留历次接替与
+  最终撤回，从链内任一历史报告 ID 查询结果一致。
+
+同一链尾的**撤回与接替并发**（无论复测仪器是否相同）至多一方成功：
+撤回方持报告行 `FOR UPDATE` 与接替事务互斥，胜方提交后败方以全新只读事务
+回填当前链状态——撤回胜则接替败方 `409 REPORT_WITHDRAWN`、
+`current_report_id=null`；接替胜则撤回败方 `409 REPORT_ALREADY_SUPERSEDED`、
+`tip_report_id` 与 `current_report_id` 指向新报告。撤回单号由全局唯一索引兜底，
+并发下也不可能绑定到第二份报告。
 
 ### 脚本化完整演示
 
@@ -523,6 +606,7 @@ curl -sS http://localhost:8000/reports/1/lineage
 bash examples/curl-demo.sh                     # curl 版全流程（含禁用登记/撤销）
 bash examples/planning-demo.sh                 # 排班规划：仪器组可放行时间窗
 bash examples/supersede-demo.sh                # 报告接替：复测、沿革与并发接替
+bash examples/withdraw-demo.sh                 # 报告撤回：撤回、拒绝接替、单号唯一与并发（本轮新增）
 BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与禁用流程的 Python 版
 ```
 
@@ -561,3 +645,16 @@ BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与�
    被阻断或编号冲突时旧报告仍有效。接替边恒由当事务内新建报告（id 单调递增）
    指向旧报告，链天然无环；沿革查询为 SERIALIZABLE 只读事务，按同一已提交状态
    沿接替边双向遍历全链。
+8. **报告撤回与接替互斥、撤回单号唯一**：撤回事务运行在 SERIALIZABLE 隔离级别，
+   先 `SELECT … FOR UPDATE` 锁定目标报告行——同一链尾的“撤回 / 接替”在此严格
+   互斥，**至多一方成功**；接替事务先查撤回记录，已撤回即拒绝（`409 REPORT_WITHDRAWN`），
+   不执行放行判定、不插入新报告。撤回登记由唯一索引
+   `uq_report_withdrawal_report`（每份报告至多撤回一次）与
+   `uq_report_withdrawal_no`（撤回单号全局唯一、不可转移/复用）在数据库层兜底；
+   非链尾（已接替）/ 已撤回分别返回 `409 REPORT_ALREADY_SUPERSEDED` /
+   `REPORT_ALREADY_WITHDRAWN`，单号冲突返回 `409 WITHDRAWAL_NO_EXISTS`，
+   全部失败整体回滚、不写撤回。败方由全新只读事务回填**当前链状态**
+   （`tip_report_id` 恒在、`current_report_id` 撤回后为 `null`）。撤回仅落到
+   `report_withdrawals`（报告 id 唯一、撤回单号全局唯一），**不改写**
+   `reports` 与快照，故详情/列表历史内容不变，漂移重算与禁用影响追溯
+   （只读实时计算）继续覆盖已撤回报告。
